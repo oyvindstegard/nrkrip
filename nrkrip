@@ -199,7 +199,7 @@ sub stream_rip {
     }
 }
 
-# Print usage to STDOUT
+# Prints usage to STDOUT
 sub print_usage_exit {
     my $name = basename($0);
     print <<"EOF";
@@ -224,7 +224,6 @@ directory, possibly with a generated parent directory based on title.
 EOF
     exit 0;
 }
-
 
 # Main program flow begin
 my ($opt_async,$opt_meta,$opt_dir,$opt_outfile) = (0,0,0,undef);

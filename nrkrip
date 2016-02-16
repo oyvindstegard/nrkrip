@@ -1,0 +1,259 @@
+#!/usr/bin/env perl
+# Rip video streams from tv.nrk.no/tv.nrksuper.no
+# Requires ffmpeg on PATH and Perl modules 'WWW::Curl', 'HTML::Parser'
+# This script will only output UTF-8 encoded data, both for output and
+# generated file names.
+
+use strict;
+use warnings;
+
+use WWW::Curl::Easy;
+use HTML::Parser;
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path);
+use Getopt::Long qw(:config bundling);
+use Encode qw(encode);
+
+binmode STDOUT, ':utf8';
+binmode STDERR, ':utf8';
+
+# Path to ffmpeg binary
+use constant FFMPEG => 'ffmpeg';
+
+# Version
+use constant VERSION => '0.1';
+
+# Fetch content at URL
+# Takes URL as first argument.
+sub http_fetch_body {
+    my ($url) = @_;
+    die("Need to supply URL!") unless $url;
+    my $curl = WWW::Curl::Easy->new;
+    $curl->setopt(CURLOPT_URL, $url);
+    my $response_body;
+    $curl->setopt(CURLOPT_WRITEDATA, \$response_body);
+    my $retcode = $curl->perform();
+
+    if ($retcode == 0) {
+        my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
+        die("Unexpected http response code: $response_code") unless ($response_code eq 200);
+
+        return $response_body;
+    } else {
+        die("An error happened: $retcode ".$curl->strerror($retcode)." ".$curl->errbuf."\n");
+    }
+}
+
+# Takes URL as first argument.
+# Returns a hash with metadata fields.
+sub metadata_get {
+    my ($url) = @_;
+    my ($html_content) = &http_fetch_body($url);
+
+    my %meta = ('url' => $url);
+    my $text = '';
+    my $state = 'U';
+
+    # Season from URL (possibly)
+    if ($url =~ /\/sesong-([0-9]+)/) {
+        $meta{'season'} = $1;
+    }
+
+    # HTML parser handlers
+    # Perhaps should've used pull-parser style instead
+    my $start_handler = sub {
+        my ($tagname, $attr) = @_;
+        if ($tagname eq 'title') {
+            $state = 'T';
+        } elsif ($tagname eq 'meta') {
+            if (exists $attr->{'name'} && exists $attr->{'content'}) {
+                my ($metaname, $content) = ($attr->{'name'}, $attr->{'content'});
+                if ($metaname eq 'episodenumber') {
+                    $meta{'episode'} = $content;
+                } elsif ($metaname eq 'seriestitle') {
+                    $meta{'seriestitle'} = $content;
+                }
+            }
+        } elsif ($tagname eq 'div') {
+            my $class = exists $attr->{'class'} ? $attr->{'class'} : "";
+            if (exists $attr->{'data-hls-media'} && !exists $meta{'streamUrl'}) {
+                $meta{'streamUrl'} = $attr->{'data-hls-media'};
+                $state = 'U';
+            } elsif ($class eq 'seasons-container') {
+                $state = 'S1';
+            } elsif ($state eq 'S1' && $class eq 'season-box') {
+                $state = 'S2';
+            } elsif ($state eq 'S2' && $class eq 'box-heading') {
+                $state = 'S3';
+            } else {
+                $state = 'U';
+            }
+        } elsif ($tagname eq 'h2' && $state eq 'S3') {
+            $state = 'S4';
+        } else {
+            $state = 'U';
+        }
+    };
+    my $text_handler = sub {
+        if ($state eq 'T' || $state eq 'S4') {
+            $text = $_[0];
+        }
+    };
+    my $end_handler = sub {
+        my ($tagname) = @_;
+        if ($tagname eq 'title' && !exists $meta{'title'}) {
+            $meta{'title'} = $text;
+        } elsif ($tagname eq 'h2' && $state eq 'S4') {
+            $text =~ s/Sesong *//;
+            $meta{'season'} = $text unless exists $meta{'season'};
+            $state = 'U';
+        }
+    };
+
+    # HTML event parser
+    my $p = HTML::Parser->new(api_version => 3, 
+                              start_h => [$start_handler, "tagname, attr"],
+                              text_h => [$text_handler, "dtext"],
+                              end_h => [$end_handler, "tagname"],
+                              utf8_mode => 1,
+                              unbroken_text => 1
+          );
+    $p->parse($html_content);
+
+    # Some cleanups and formatting of values
+    $meta{'title'} =~ s/^(NRK (Super )?TV)?[\s-]*|[\s-]*([0-9]+:[0-9]+)?$//g if exists $meta{'title'};
+    $meta{'episode'} = sprintf("%02d", $meta{'episode'}) if exists $meta{'episode'};
+    $meta{'season'} = sprintf("%02d", $meta{'season'}) if exists $meta{'season'};
+
+    return \%meta;
+}
+
+sub metadata_print {
+    my ($meta) = @_;
+    foreach my $key (sort keys %$meta) {
+        my $value = $meta->{$key};
+        print ucfirst($key),":\t",$value,"\n";
+    }
+}
+
+sub outfile_prepare {
+    my ($opt_outfile, $opt_dir, $opt_meta, $meta) = @_;
+    my ($outfile, $outdir);
+    if ($opt_outfile) {
+        $outfile = $opt_outfile;
+    } elsif (exists $meta->{'title'}) {
+        $outfile = $meta->{'title'};
+
+        if (exists $meta->{'episode'}) {
+            my $episode = $meta->{'episode'};
+            my $season = exists $meta->{'season'} ? $meta->{'season'} : '01';
+            $outfile = "$outfile S${season}E${episode}";
+        }
+
+        if (exists $meta->{'seriestitle'}) {
+            $outdir = $meta->{'seriestitle'};
+        } else {
+            $outdir = $meta->{'title'};
+            $outdir =~ s/([0-9]{2,4}\.){2}[0-9]{2,4}//;
+            $outdir =~ s/^(\s|-)+|(\s|-)+$//g;
+        }
+        if (-d encode('UTF-8',$outdir) or $opt_dir) {
+            $outfile = "$outdir/$outfile";
+        }
+    } else {
+        die('No titles available, and no output file provided');
+    }
+    $outfile = $outfile . '.mp4' unless $outfile =~ /\.mp4$/;
+
+    if (! -d encode('UTF-8',dirname($outfile)) and !$opt_meta) {
+        make_path(encode('UTF-8',dirname($outfile))) or die("Failed to create parent dirs of output file: $outfile");
+    }
+    
+    return $outfile;
+}
+
+# Invoke ffmpeg to save stream URL to file with necessary compatiblity
+# conversions.
+sub stream_rip {
+    my ($streamUrl, $outfile, $opt_async) = @_;
+    if (my $pid = fork) {
+        if ($opt_async) {
+            my $logfile = "nrkrip.ffmpeg-$pid.log";
+            print "FFmpeg background job started with pid:\t$pid\n";
+            print "Log file:\t$logfile\n";
+        } else { 
+            wait;
+            print "FFmpeg exited.\n";
+        }
+    } else {
+        my @ffmpeg_opts = ('-c','copy','-bsf:a','aac_adtstoasc');
+        if ($opt_async) {
+            my $logfile = "nrkrip.ffmpeg-$$.log";
+            push @ffmpeg_opts, '-y';
+            open my $logfh, ">$logfile";
+            open STDOUT, ">&", \$logfh;
+            open STDERR, ">&", \$logfh;
+            close STDIN;
+        }
+        exec (FFMPEG,'-i',$streamUrl,@ffmpeg_opts,encode('UTF-8',$outfile)) or die("Failed to execute ffmpeg: $!");
+    }
+}
+
+# Print usage to STDOUT
+sub print_usage_exit {
+    my $name = basename($0);
+    print <<"EOF";
+Use: ${name} [opts] URL
+
+URL can be a direct HLS stream URL, or URL to an episode or program on
+tv.nrk.no/tv.nrksuper.no. By default, output files are saved to current
+directory, possibly with a generated parent directory based on title.
+
+--outfile,  Optionally set output file. Normally, a suitable file name is generated.
+-o          If a direct HLS stream URL is provided, you must provide output file name.
+
+--async,    Enable async mode - stream rips are executed as background jobs.
+-a          Note that existing output files are overwritten automatically when running
+            in this mode.
+
+--onlymeta, Only show extracted metadata from URL, do not actually rip video
+-m          stream.
+
+--dir,      Always use a title-based directory as parent of default output file, even
+-d          though it does not already exist (will be created on demand).
+EOF
+    exit 0;
+}
+
+
+# Main program flow begin
+my ($opt_async,$opt_meta,$opt_dir,$opt_outfile) = (0,0,0,undef);
+GetOptions('help|h' => \&print_usage_exit,
+           'async|a' => \$opt_async,
+           'onlymeta|m' => \$opt_meta,
+           'dir|d' => \$opt_dir,
+           'o|outfile=s' => \$opt_outfile
+    );
+die('Error: missing URL') if (! exists $ARGV[0]);
+my $url = $ARGV[0];
+
+print "--- NRK rip ---\n\n";
+
+my $meta = {};
+if ($url =~ /^https?:\/\/tv\.nrk(super)?\.no/) {
+    $meta = &metadata_get($url);
+}
+if (!exists $meta->{'streamUrl'}) {
+    $meta->{'streamUrl'} = $url;
+}
+my $outfile = &outfile_prepare($opt_outfile,$opt_dir,$opt_meta,$meta);
+print "--- Stream metadata ---\n";
+&metadata_print($meta);
+print "Outfile:\t$outfile\n";
+print "--- End stream metadata ---\n\n";
+exit 0 if ($opt_meta);
+
+print "--- FFmpeg ---\n";
+&stream_rip($meta->{'streamUrl'}, $outfile, $opt_async);
+print "--- End FFmpeg ---\n\n";
+print "--- End NRK rip ---\n";

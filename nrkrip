@@ -4,6 +4,8 @@
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
 
+package nrkrip;
+
 use strict;
 use warnings;
 
@@ -22,7 +24,7 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.1';
+use constant VERSION => '0.2';
 
 # Fetch content at URL
 # Takes URL as first argument.
@@ -50,8 +52,11 @@ sub http_fetch_body {
 # Returns a hash with metadata fields.
 sub get_metadata {
     my ($url) = @_;
-    my ($html_content) = &http_fetch_body($url);
+    if (not $url =~ /^https?:\/\/tv\.nrk(super)?\.no/) {
+        return {};
+    }
 
+    my $html_content = &http_fetch_body($url);
     my %meta = ('url' => $url);
     my @context = ();
     my $text = '';
@@ -61,10 +66,10 @@ sub get_metadata {
         $meta{'season'} = $1;
     }
 
-    # HTML parser handler subs
+    # HTML parser handler routines
     my $start_handler = sub {
         my ($tagname, $attr) = @_;
-        my $class = exists $attr->{'class'} ? $attr->{'class'} : undef;
+        my $class = exists $attr->{'class'} ? $attr->{'class'} : '';
         push @context, [$tagname, $class];
 
         if ('meta' eq $tagname) {
@@ -76,15 +81,20 @@ sub get_metadata {
                     $meta{'seriestitle'} = $content;
                 }
             }
-        }
-        elsif ('div' eq $tagname) {
+        } elsif ('div' eq $tagname) {
             if (exists $attr->{'data-hls-media'} && !exists $meta{'streamUrl'}) {
                 $meta{'streamUrl'} = $attr->{'data-hls-media'};
+            }
+        } elsif ('a' eq $tagname and $class eq 'season-link ui-state-selected') {
+            if (exists $attr->{'title'} and not exists $meta{'season'}) {
+                if ($attr->{'title'} =~ /[Ss]esong ([0-9]+)/) {
+                    $meta{'season'} = $1;
+                }
             }
         }
     };
     my $text_handler = sub {
-        return if (not @context);
+        return unless @context;
         $text = $_[0];
     };
     my $end_handler = sub {
@@ -101,8 +111,8 @@ sub get_metadata {
                 $meta{'season'} = $text unless exists $meta{'season'};
             }
         } elsif ($tagname eq 'script') {
-            if ($text =~ /nrk\.playerstats.*ga: *{.*programTitle":"([^"]+)"/ms) {
-                $meta{'programTitlePlayerStats'} = $1;
+            if ($text =~ /nrk\.playerstats *=[^;]+ga: *{[^;]*"programTitle":"([^"]+)"/ms) {
+                $meta{'playerStats.title'} = $1;
             }
         }
     };
@@ -119,11 +129,12 @@ sub get_metadata {
 
     # Some cleanups and formatting of values
     $meta{'title'} =~ s/^(NRK (Super )?TV)?[\s-]*|[\s-]*([0-9]+:[0-9]+)?$//g if exists $meta{'title'};
-    if (exists $meta{'title'} and $meta{'title'} eq $meta{'seriestitle'} and !exists $meta{'season'}
-        and exists $meta{'programTitlePlayerStats'}) {
-        $meta{'title'} = $meta{'programTitlePlayerStats'};
+    if (exists $meta{'title'} and exists $meta{'seriestitle'}
+        and $meta{'title'} eq $meta{'seriestitle'} and !exists $meta{'season'}
+        and exists $meta{'playerStats.title'}) {
+        $meta{'title'} = $meta{'playerStats.title'};
     }
-    delete $meta{'programTitlePlayerStats'};
+    delete $meta{'playerStats.title'};
     $meta{'episode'} = sprintf("%02d", $meta{'episode'}) if exists $meta{'episode'};
     $meta{'season'} = sprintf("%02d", $meta{'season'}) if exists $meta{'season'};
 
@@ -174,12 +185,27 @@ sub prepare_outfile {
     return $outfile;
 }
 
+# Read list of URLs from a file
+sub read_urls_from_file {
+    my ($file) = @_;
+    my @urls = ();
+    open FILE, $file or die("Unable to open file: $file");
+    while (<FILE>) {
+        next if (/^\s*#/ or /^\s*$/);
+        s/^\s*|\s*$//;
+        chomp;
+        push @urls, $_;
+    }
+    close FILE;
+    return @urls;
+}
+
 # Generates a suitable log file name, based on output file and PID
 sub generate_logfile_name {
     my ($outfile, $pid) = @_;
     my $name = basename $outfile;
     $name =~ s/\.[a-zA-Z0-9]+$//;
-    $name =~ s/[ -]+/_/g;
+    $name =~ s/[^a-zA-Z0-9]+/_/g;
     return "ffmpeg-nrkrip-${name}-${pid}.log";
 }
 
@@ -188,11 +214,11 @@ sub generate_logfile_name {
 # If async mode, returns PID and associated log file as list, otherwise returns
 # ffmpeg exit code.
 sub rip_stream {
-    my ($streamUrl, $outfile, $opt_async) = @_;
+    my ($streamUrl, $outfile, $opt_async, $opt_owr) = @_;
     if (my $pid = fork) {
         if ($opt_async) {
             my $logfile = &generate_logfile_name($outfile, $pid);
-            print "FFmpeg background job started with sentinel pid:\t$pid\n";
+            print "FFmpeg background job started with sentinel PID:\t$pid\n";
             print "Log file:\t$logfile\n";
             return ($pid, $logfile);
         } else {
@@ -202,20 +228,44 @@ sub rip_stream {
     } else {
         # FFmpeg sentinel process
         my @ffmpeg_opts = ('-c','copy','-bsf:a','aac_adtstoasc');
-        open LOGFH, ">&STDOUT";
+        push @ffmpeg_opts, '-y' if ($opt_owr);
+        open LOGFH, ">&STDERR";
         if ($opt_async) {
             my $logfile = encode('UTF-8', &generate_logfile_name($outfile, $$));
-            push @ffmpeg_opts, '-y';
             open LOGFH, ">$logfile" or die("Failed to open log file: $!");
             open STDOUT, ">&LOGFH";
             open STDERR, ">&LOGFH";
             open STDIN, "</dev/null";
         }
-        my $status = system(FFMPEG,'-i',$streamUrl,@ffmpeg_opts,encode('UTF-8',$outfile));
-        my $exitcode = $status >> 8 & 0xff;
-        print LOGFH "\nFFmpeg exited with code ${exitcode}\n";
+
+        system(FFMPEG,'-i',$streamUrl,@ffmpeg_opts,encode('UTF-8',$outfile));
+        my $exitcode = $? >> 8;
+        if ($? == -1) {
+            print LOGFH "Failed to execute ffmpeg:\t$!\n";
+        } elsif ($? & 127) {
+            printf LOGFH "ffmpeg died with signal\t%d\n", ($? & 127);
+        } else {
+            if ($opt_async || $exitcode != 255) {
+                printf LOGFH "ffmpeg exited with value\t%d\n", $exitcode;
+            }
+        }
         exit $exitcode;
     }
+}
+
+sub wait_for_jobs {
+    my ($jobs, $num_waits) = @_;
+    my $num_running = keys %$jobs;
+    print "--- Waiting for background jobs ($num_running running) .. ---\n";
+    while ($num_waits > 0 and (my $pid = wait) != -1) {
+        my $url = $jobs->{$pid}->[1];
+        my $exitcode = $? >> 8 & 0xff;
+        print "Job\t$url\texited with code\t$exitcode\n";
+        $num_waits--;
+        delete $jobs->{$pid};
+    }
+    print "--- End waiting ---\n";
+    print "\n";
 }
 
 sub print_version_exit {
@@ -232,19 +282,19 @@ sub print_version_exit {
 sub print_usage_exit {
     my $name = basename($0);
     print <<"EOF";
-Use: ${name} [opts] [URL] [URL2..]
+Use: ${name} [opts] SOURCE [SOURCE ..]
 
-Expected is browser playback URLs for episodes or programs on
-tv.nrk.no/tv.nrksuper.no. By default, output files are saved to current
-directory, possibly with a generated parent directory based on title.
+SOURCE is typically a playback URL for an episode or program on
+tv.nrk.no/tv.nrksuper.no. It can also be a file with list of such URLs.
 
-You may alternativly provide a single direct HLS stream URL, which will be
-ripped. Automatic file name generation is not available in such cases, and
-"--outfile" is required.
+You may alternativly provide direct HLS stream URLs, which will be ripped. This
+may be used to rip from sources other than NRK.
 
---async,    Enable async mode - stream rips are executed as background jobs.
--a          Note that existing output files are overwritten automatically when running
-            in this mode.
+By default, output files are saved to current directory, possibly with a
+generated parent directory based on title.
+
+--async,    Enable async mode - stream rips are executed in parallel as background jobs.
+-a
 
 --wait,     When using async mode, wait for all background jobs before exiting,
 -w          and report their status as they finish.
@@ -252,12 +302,16 @@ ripped. Automatic file name generation is not available in such cases, and
 --onlymeta, Only show extracted metadata from URL, do not actually rip video
 -m          stream or write any files.
 
---outfile,  Optionally set output file. Normally, a suitable file name is generated.
--o          If a direct HLS stream URL is provided, you must provide output file name.
-            This option is not compatible with multiple URLs.
+--outfile,  Optionally set output file. (Normally, a suitable file name is generated.)
+-o          This option is not compatible with multiple URLs.
 
---dir,      Always use a title-based directory as parent of default output file, even
+--jobs,     Max number of simultaneous background jobs (integer >= 1). Default is unlimited.
+-j          Only applicable when using '--wait'.
+
+--dir,      Always use a title-based directory as parent of output files, even
 -d          though it does not already exist (will be created on demand).
+
+-y          Always overwrite output files. Useful especially when running in async mode.
 
 --version,  Show versions of script, Perl and ffmpeg.
 -v
@@ -266,14 +320,16 @@ EOF
 }
 
 # Main program flow begin
-my ($opt_async,$opt_meta,$opt_dir,$opt_wait,$opt_outfile) = (0,0,0,0,undef);
+my ($opt_async,$opt_meta,$opt_dir,$opt_wait,$opt_jobs,$opt_owr,$opt_outfile) = (0,0,0,0,0,0,undef);
 GetOptions('help|h' => \&print_usage_exit,
            'async|a' => \$opt_async,
            'onlymeta|m' => \$opt_meta,
            'dir|d' => \$opt_dir,
            'o|outfile=s' => \$opt_outfile,
            'w|wait' => \$opt_wait,
-           'v|version' => \&print_version_exit
+           'v|version' => \&print_version_exit,
+           'j|jobs=i' => \$opt_jobs,
+           'y' => \$opt_owr
     );
 
 die('Error: missing URL(s)') if (! exists $ARGV[0]);
@@ -285,13 +341,24 @@ my $url = $ARGV[0];
 print "--- NRK rip ---\n\n";
 
 my %jobs = ();
+my %urls = ();
+my $stream_id = 0;
 while (my $url = shift) {
-    my $meta = {};
-    if ($url =~ /^https?:\/\/tv\.nrk(super)?\.no/) {
-        $meta = &get_metadata($url);
+    if (-f $url) {
+        push @ARGV, &read_urls_from_file($url);
+        next;
     }
+    next if $urls{$url};
+    $urls{$url} = 1;
+    ++$stream_id;
+
+    my $meta = &get_metadata($url);
     if (!exists $meta->{'streamUrl'}) {
         $meta->{'streamUrl'} = $url;
+    }
+    if (!exists $meta->{'title'}) {
+        $meta->{'title'} = sprintf("Stream %03d", $stream_id);
+        $meta->{'seriestitle'} = "Streams";
     }
     my $outfile = &prepare_outfile($opt_outfile,$opt_dir,$opt_meta,$meta);
     print "--- Stream metadata ---\n";
@@ -303,22 +370,20 @@ while (my $url = shift) {
     print "--- FFmpeg ---\n";
     if ($opt_async) {
         my ($pid, $logfile) = &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async);
-        $jobs{$pid} = $logfile;
+        $jobs{$pid} = [$logfile,$url];
     } else {
-        &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async);
+        &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async, $opt_owr);
     }
     print "--- End FFmpeg ---\n\n";
+    
+    if ($opt_wait and $opt_jobs > 0 and keys %jobs >= $opt_jobs) {
+        my $overflow = scalar (keys %jobs) - $opt_jobs;
+        &wait_for_jobs(\%jobs, $overflow == 0 ? 1 : $overflow);
+    }
 }
 
-if ($opt_wait && keys %jobs > 0) {
-    print "--- Waiting for background jobs ---\n";
-    while ((my $pid = wait) != -1) {
-        my $logfile = $jobs{$pid};
-        my $exitcode = $? >> 8 & 0xff;
-        print "Job\t$logfile\texited with code\t$exitcode\n";
-    }
-    print "--- End waiting ---\n";
-    print "\n";
+if ($opt_wait and keys %jobs > 0) {
+    &wait_for_jobs(\%jobs, scalar keys %jobs);
 }
 
 print "--- End NRK rip ---\n";

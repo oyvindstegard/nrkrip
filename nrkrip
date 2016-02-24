@@ -3,6 +3,9 @@
 # Requires ffmpeg on PATH and Perl modules 'WWW::Curl', 'HTML::Parser'
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
+#
+# TODO subtitles (webvtt to srt)
+# TODO ffmpeg progress indicator in percent
 
 package nrkrip;
 

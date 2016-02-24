@@ -336,7 +336,6 @@ die('Error: missing URL(s)') if (! exists $ARGV[0]);
 if ($opt_outfile and scalar @ARGV > 1) {
     die('Error: output file cannot be specified when multiple URLs are provided.');
 }
-my $url = $ARGV[0];
 
 print "--- NRK rip ---\n\n";
 

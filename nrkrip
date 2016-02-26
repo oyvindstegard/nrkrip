@@ -4,8 +4,9 @@
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
 #
-# TODO subtitles (webvtt to srt)
-# TODO ffmpeg progress indicator in percent
+# TODO ffmpeg progress output as percentage (by looking at timestamps)
+#
+# Author: oyvind.stegard@ifi.uio.no, http://stegard.net/
 
 package nrkrip;
 
@@ -17,7 +18,7 @@ use HTML::Parser;
 use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
 use Getopt::Long qw(:config bundling);
-use Encode qw(encode);
+use Encode qw(encode decode);
 
 # Encode strings printed to stdout/stderr as UTF-8
 binmode STDOUT, ':utf8';
@@ -27,39 +28,42 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.2';
+use constant VERSION => '0.3';
 
 # Fetch content at URL
-# Takes URL as first argument.
+# Takes URL as first argument, and a ref as second arg
+# Returns http status code if request went through, otherwise a negative
+# value is returned (which is the curl error code)
+# Content will be stored in variable referred to by second argument
 sub http_fetch_body {
-    my ($url) = @_;
-    die("Need to supply URL!") unless $url;
+    die("http_fetch_body: wrong number of arguments") if @_ != 2;
+    my ($url, $content) = @_;
+    if (!$url) { return undef };
     my $curl = WWW::Curl::Easy->new;
     $curl->setopt(CURLOPT_URL, $url);
     $curl->setopt(CURLOPT_FOLLOWLOCATION, 1);
-    my $response_body;
-    $curl->setopt(CURLOPT_WRITEDATA, \$response_body);
+    $$content = undef;
+    $curl->setopt(CURLOPT_WRITEDATA, $content);
     my $retcode = $curl->perform();
 
     if ($retcode == 0) {
-        my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
-        die("Unexpected http response code: $response_code") unless ($response_code eq 200);
-
-        return $response_body;
+        return $curl->getinfo(CURLINFO_HTTP_CODE);
     } else {
-        die("An error happened: $retcode ".$curl->strerror($retcode)." ".$curl->errbuf."\n");
+        return -$retcode;
     }
 }
 
 # Takes URL as first argument.
-# Returns a hash with metadata fields.
+# Returns a ref to a hash with metadata fields.
 sub get_metadata {
     my ($url) = @_;
     if (not $url =~ /^https?:\/\/tv\.nrk(super)?\.no/) {
         return {};
     }
 
-    my $html_content = &http_fetch_body($url);
+    my $html_content;
+    &http_fetch_body($url, \$html_content) == 200 or die("Failed to fetch: $url");
+
     my %meta = ('url' => $url);
     my @context = ();
     my $text = '';
@@ -130,7 +134,7 @@ sub get_metadata {
                               empty_element_tags => 1);
     $p->parse($html_content);
 
-    # Some cleanups and formatting of values
+    # Some cleanups, formatting of values and addition of derived values
     $meta{'title'} =~ s/^(NRK (Super )?TV)?[\s-]*|[\s-]*([0-9]+:[0-9]+)?$//g if exists $meta{'title'};
     if (exists $meta{'title'} and exists $meta{'seriestitle'}
         and $meta{'title'} eq $meta{'seriestitle'} and !exists $meta{'season'}
@@ -144,6 +148,32 @@ sub get_metadata {
     return \%meta;
 }
 
+# Try to fetch subtitle stream
+# Returns subtitle stream as a string in ".srt" format if successful
+sub get_subtitles {
+    my ($cc_url) = @_;
+    $cc_url =~ s/^(.*\.m3u8)~.*/$1/;
+    my $content;
+    return undef unless &http_fetch_body($cc_url, \$content) == 200;
+
+    my @playlist_files = grep { /^[a-zA-Z0-9]/ } split("[\n\r]", $content);
+    return undef unless scalar @playlist_files > 0;
+
+    # TODO should use proper URL expansion here:
+    (my $webvtt_url = $cc_url) =~ s/\/[^\/]+$//;
+    $webvtt_url = $webvtt_url . "/" . $playlist_files[0];
+
+    return undef unless &http_fetch_body($webvtt_url, \$content) == 200;
+
+    # Convert WEBVTT to SRT
+    $content = decode('UTF-8', $content);
+    $content =~ s/([0-9]{2})\.([0-9]{3})/$1,$2/g;
+    $content =~ s/.*?\n1/1/s;
+
+    return $content;
+}
+
+# Print metadata to standard output
 sub print_metadata {
     my ($meta) = @_;
     foreach my $key (sort keys %$meta) {
@@ -152,6 +182,8 @@ sub print_metadata {
     }
 }
 
+# Generate dir and file name based on metadata or explicit file name
+# Return path to output file
 sub prepare_outfile {
     my ($opt_outfile, $opt_dir, $opt_meta, $meta) = @_;
     my ($outfile, $outdir);
@@ -212,12 +244,13 @@ sub generate_logfile_name {
     return "ffmpeg-nrkrip-${name}-${pid}.log";
 }
 
+
 # Invoke ffmpeg to save stream URL to file with necessary compatiblity
 # conversions.
 # If async mode, returns PID and associated log file as list, otherwise returns
 # ffmpeg exit code.
 sub rip_stream {
-    my ($streamUrl, $outfile, $opt_async, $opt_owr) = @_;
+    my ($streamUrl, $outfile, $opt_async, $opt_owr, $opt_subs) = @_;
     if (my $pid = fork) {
         if ($opt_async) {
             my $logfile = &generate_logfile_name($outfile, $pid);
@@ -229,7 +262,7 @@ sub rip_stream {
             return $? >> 8 & 0xff;
         }
     } else {
-        # FFmpeg sentinel process
+        # Sentinel process
         my @ffmpeg_opts = ('-c','copy','-bsf:a','aac_adtstoasc');
         push @ffmpeg_opts, '-y' if ($opt_owr);
         open LOGFH, ">&STDERR";
@@ -240,7 +273,27 @@ sub rip_stream {
             open STDERR, ">&LOGFH";
             open STDIN, "</dev/null";
         }
-
+        # Subtitles
+        if ($opt_subs and $streamUrl =~ m/\?cc1=(uri[^&]+)/) {
+            my $cc_url = $1;
+            $cc_url =~ s/^uri%3[dD]//;
+            $cc_url =~ s/\+/ /g;
+            $cc_url =~ s/%([A-Fa-f\d]{2})/chr hex $1/ge;
+            if (my $subtitles = &get_subtitles($cc_url)) {
+                (my $srtfile = $outfile) =~ s/\.[^\.]+$/.srt/;
+                if ($opt_owr or not -e $srtfile) {
+                    open SRTFILE, ">$srtfile" or die("Failed to open file for writing: $srtfile");
+                    binmode SRTFILE, ':utf8';
+                    print SRTFILE $subtitles;
+                    print "Wrote subtitles to: $srtfile\n\n";
+                    close SRTFILE;
+                } else {
+                    print "Warning: Not overwriting existing subtitle file: $srtfile\n";
+                    print "         Use '-y' to overwrite files automatically.\n";
+                }
+            }
+        }
+        # FFmpeg
         system(FFMPEG,'-i',$streamUrl,@ffmpeg_opts,encode('UTF-8',$outfile));
         my $exitcode = $? >> 8;
         if ($? == -1) {
@@ -296,42 +349,46 @@ may be used to rip from sources other than NRK.
 By default, output files are saved to current directory, possibly with a
 generated parent directory based on title.
 
---async,    Enable async mode - stream rips are executed in parallel as background jobs.
+--async,   Enable async mode - stream rips are executed in parallel as background jobs.
 -a
 
---wait,     When using async mode, wait for all background jobs before exiting,
--w          and report their status as they finish.
+--wait,    When using async mode, wait for all background jobs before exiting,
+-w         and report their status as they finish.
 
---onlymeta, Only show extracted metadata from URL, do not actually rip video
--m          stream or write any files.
+--meta,    Only show extracted metadata from URL, do not actually rip video
+-m         stream or write any files.
 
---outfile,  Optionally set output file. (Normally, a suitable file name is generated.)
--o          This option is not compatible with multiple URLs.
+--out,     Optionally set output file. (Normally, a suitable file name is generated.)
+-o         This option is not compatible with multiple URLs.
 
---jobs,     Max number of simultaneous background jobs (integer >= 1). Default is unlimited.
--j          Only applicable when using '--wait'.
+--jobs,    Max number of simultaneous background jobs (integer >= 1). Default is unlimited.
+-j         Only applicable when using '--wait'.
 
---dir,      Always use a title-based directory as parent of output files, even
--d          though it does not already exist (will be created on demand).
+--dir,     Always use a title-based directory as parent of output files, even
+-d         though it does not already exist (will be created on demand).
 
--y          Always overwrite output files. Useful especially when running in async mode.
+--subs,    Experimental: try to fetch and convert subtitles. If successful, the subtitles will
+-s         be saved in ".srt" format using the same basename as the output file.
 
---version,  Show versions of script, Perl and ffmpeg.
+-y         Always overwrite output files. Useful especially when running in async mode.
+
+--version, Show versions of script, Perl and ffmpeg.
 -v
 EOF
     exit 0;
 }
 
 # Main program flow begin
-my ($opt_async,$opt_meta,$opt_dir,$opt_wait,$opt_jobs,$opt_owr,$opt_outfile) = (0,0,0,0,0,0,undef);
-GetOptions('help|h' => \&print_usage_exit,
-           'async|a' => \$opt_async,
-           'onlymeta|m' => \$opt_meta,
-           'dir|d' => \$opt_dir,
-           'o|outfile=s' => \$opt_outfile,
+my ($opt_async,$opt_meta,$opt_dir,$opt_wait,$opt_jobs,$opt_subs,$opt_owr,$opt_outfile) = (0,0,0,0,0,0,undef);
+GetOptions('h|help' => \&print_usage_exit,
+           'a|async' => \$opt_async,
+           'm|meta' => \$opt_meta,
+           'd|dir' => \$opt_dir,
+           'o|out=s' => \$opt_outfile,
            'w|wait' => \$opt_wait,
            'v|version' => \&print_version_exit,
            'j|jobs=i' => \$opt_jobs,
+           's|subs' => \$opt_subs,
            'y' => \$opt_owr
     );
 
@@ -362,6 +419,7 @@ while (my $url = shift) {
         $meta->{'title'} = sprintf("Stream %03d", $stream_id);
         $meta->{'seriestitle'} = "Streams";
     }
+
     my $outfile = &prepare_outfile($opt_outfile,$opt_dir,$opt_meta,$meta);
     print "--- Stream metadata ---\n";
     &print_metadata($meta);
@@ -369,14 +427,14 @@ while (my $url = shift) {
     print "--- End stream metadata ---\n\n";
     next if ($opt_meta);
 
-    print "--- FFmpeg ---\n";
+    print "--- Stream rip ---\n";
     if ($opt_async) {
-        my ($pid, $logfile) = &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async);
+        my ($pid, $logfile) = &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async, $opt_owr, $opt_subs);
         $jobs{$pid} = [$logfile,$url];
     } else {
-        &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async, $opt_owr);
+        &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async, $opt_owr, $opt_subs);
     }
-    print "--- End FFmpeg ---\n\n";
+    print "--- End stream rip ---\n\n";
     
     if ($opt_wait and $opt_jobs > 0 and keys %jobs >= $opt_jobs) {
         my $overflow = scalar (keys %jobs) - $opt_jobs;

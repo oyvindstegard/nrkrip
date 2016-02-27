@@ -82,10 +82,12 @@ sub get_metadata {
         if ('meta' eq $tagname) {
             if (exists $attr->{'name'} && exists $attr->{'content'}) {
                 my ($metaname, $content) = ($attr->{'name'}, $attr->{'content'});
-                if ($metaname eq 'episodenumber') {
+                if ('episodenumber' eq $metaname) {
                     $meta{'episode'} = $content;
-                } elsif ($metaname eq 'seriestitle') {
+                } elsif ('seriestitle' eq $metaname) {
                     $meta{'seriestitle'} = $content;
+                } elsif ('kategori_id' eq $metaname) {
+                    $meta{'category'} = $content;
                 }
             }
         } elsif ('div' eq $tagname) {
@@ -117,7 +119,7 @@ sub get_metadata {
                 $text =~ s/Sesong *//;
                 $meta{'season'} = $text unless exists $meta{'season'};
             }
-        } elsif ($tagname eq 'script') {
+        } elsif ('script' eq $tagname) {
             if ($text =~ /nrk\.playerstats *=[^;]+ga: *{[^;]*"programTitle":"([^"]+)"/ms) {
                 $meta{'playerStats.title'} = $1;
             }

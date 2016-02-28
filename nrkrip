@@ -158,19 +158,43 @@ sub get_subtitles {
     my $content;
     return undef unless &http_fetch_body($cc_url, \$content) == 200;
 
-    my @playlist_files = grep { /^[a-zA-Z0-9]/ } split("[\n\r]", $content);
+    my @playlist_files = grep { /^[a-zA-Z0-9]/ } split("\n", $content);
     return undef unless scalar @playlist_files > 0;
 
-    # TODO should use proper URL expansion here:
-    (my $webvtt_url = $cc_url) =~ s/\/[^\/]+$//;
-    $webvtt_url = $webvtt_url . "/" . $playlist_files[0];
+    $content = '';
+    my $prev_number = -1;
+    foreach my $webvtt_ref (@playlist_files) {
+        # TODO should use proper URL expansion here:
+        (my $webvtt_url = $cc_url) =~ s/\/[^\/]+$//;
+        $webvtt_url = $webvtt_url . "/" . $webvtt_ref;
+        my $webvtt_content;
+        return undef unless &http_fetch_body($webvtt_url, \$webvtt_content) == 200;
 
-    return undef unless &http_fetch_body($webvtt_url, \$content) == 200;
+        $webvtt_content =~ s/^.*?\n([0-9]+\n)/$1/s;  # strip webvtt header
+        my $first_number = $1;
+        if ($webvtt_content =~ /[^\n]$/s) {
+            $webvtt_content .= "\n\n";
+        } elsif ($webvtt_content =~ /[^\n]\n$/s) {
+            $webvtt_content .= "\n";
+        }
+        # Fixup duplicates
+        if ($first_number == $prev_number) {
+            $webvtt_content =~ s/^.*?\n\n(.*)$/$1/s;
+        }
+        if ($webvtt_content =~ /.*\n\n([0-9]+)\n/s) {
+            $prev_number = $1;
+        } else {
+            $prev_number = $first_number;
+        }
 
-    # Convert WEBVTT to SRT
+        $content .= $webvtt_content;
+    }
+
+
+    # Convert WEBVTT content to SRT
     $content = decode('UTF-8', $content);
     $content =~ s/([0-9]{2})\.([0-9]{3})/$1,$2/g;
-    $content =~ s/.*?\n1/1/s;
+    $content =~ s/\r//sg;
 
     return $content;
 }
@@ -276,7 +300,7 @@ sub rip_stream {
             open STDIN, "</dev/null";
         }
         # Subtitles
-        if ($opt_subs and $streamUrl =~ m/\?cc1=(uri[^&]+)/) {
+        if ($opt_subs and $streamUrl =~ /\?cc1=(uri[^&]+)/) {
             my $cc_url = $1;
             $cc_url =~ s/^uri%3[dD]//;
             $cc_url =~ s/\+/ /g;
@@ -285,7 +309,7 @@ sub rip_stream {
                 (my $srtfile = $outfile) =~ s/\.[^\.]+$/.srt/;
                 if ($opt_owr or not -e $srtfile) {
                     open SRTFILE, ">$srtfile" or die("Failed to open file for writing: $srtfile");
-                    binmode SRTFILE, ':utf8';
+                    binmode SRTFILE, ':utf8:crlf';
                     print SRTFILE $subtitles;
                     print "Wrote subtitles to: $srtfile\n\n";
                     close SRTFILE;

@@ -28,7 +28,7 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.3';
+use constant VERSION => '0.4';
 
 # Fetch content at URL
 # Takes URL as first argument, and a ref as second arg

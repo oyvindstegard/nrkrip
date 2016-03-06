@@ -4,8 +4,6 @@
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
 #
-# TODO ffmpeg progress output as percentage (by looking at timestamps)
-#
 # Author: oyvind.stegard@ifi.uio.no, http://stegard.net/
 
 package nrkrip;
@@ -28,7 +26,7 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.4';
+use constant VERSION => '0.5';
 
 # Fetch content at URL
 # Takes URL as first argument, and a ref as second arg
@@ -255,7 +253,9 @@ sub read_urls_from_file {
         next if (/^\s*#/ or /^\s*$/);
         s/^\s*|\s*$//;
         chomp;
-        push @urls, $_;
+        if (/^https?:\/\//) {
+            push @urls, $_;
+        }
     }
     close FILE;
     return @urls;
@@ -269,7 +269,6 @@ sub generate_logfile_name {
     $name =~ s/[^a-zA-Z0-9]+/_/g;
     return "ffmpeg-nrkrip-${name}-${pid}.log";
 }
-
 
 # Invoke ffmpeg to save stream URL to file with necessary compatiblity
 # conversions.
@@ -319,6 +318,7 @@ sub rip_stream {
                 }
             }
         }
+        
         # FFmpeg
         system(FFMPEG,'-i',$streamUrl,@ffmpeg_opts,encode('UTF-8',$outfile));
         my $exitcode = $? >> 8;
@@ -350,6 +350,60 @@ sub wait_for_jobs {
     print "\n";
 }
 
+# Analyzes ffmpeg output and prints progress as a number between 0.0
+# and 100.0.
+# If input file is "-", then continuous mode is enabled and
+# data is read from STDIN.
+# Exits with code 0 on success, non-zero otherwise.
+sub print_progress {
+    my ($logfile) = @_;
+    my $continuous = 0;
+    if ("-" eq $logfile) {
+        open INPUT, "<&=STDIN" or die("Failed to open STDIN: $!");
+        $continuous = 1;
+    } else {
+        open INPUT, '<', $logfile or die("Failed to open file for analysis: $logfile: $!");
+    }
+
+    my ($duration_secs, $progress_secs, $prev_progress_secs) = (0,0,-1);
+    my $buf;
+    # Have to read raw, since ffmpeg uses '\r' in output, and we need to capture those as lines
+    local $| = 1; # force output flushing
+    while (read INPUT, my $data, 128) {
+        $buf .= $data;
+        my @lines = ();
+        if ($buf =~ /[\r\n]([^\r\n]*)$/s) {
+            @lines = split(/[\r\n]/, $buf);
+            if ($1) {
+                $buf = pop @lines;
+            } else {
+                $buf = '';
+            }
+        } else {
+            next;
+        }
+        foreach (@lines) {
+            if (/^\s*Duration:\s*([0-9]{2,}):([0-9]{2}):([0-9]{2})\.[0-9]{2,}/) {
+                $duration_secs = $1*60*60 + $2*60 + $3;
+                next;
+            }
+            if (/.*time=([0-9]{2,}):([0-9]{2}):([0-9]{2})\.[0-9]{2,}\s+bitrate=/s) {
+                $progress_secs = $1*60*60 + $2*60 + $3;
+            }
+            if (/^video:.*?muxing overhead/ and $duration_secs) {
+                $progress_secs = $duration_secs;
+            }
+            if ($continuous and $duration_secs and $progress_secs != $prev_progress_secs) {
+                printf "%.2f\n", ($progress_secs/$duration_secs) * 100;
+                $prev_progress_secs = $progress_secs;
+            }
+        }
+    }
+    exit 1 unless $duration_secs;
+    printf "%.2f\n", ($progress_secs/$duration_secs) * 100;
+    exit 0;
+}
+
 sub print_version_exit {
     my $name = basename($0);
     print "$name v" . VERSION . "\n";
@@ -375,37 +429,58 @@ may be used to rip from sources other than NRK.
 By default, output files are saved to current directory, possibly with a
 generated parent directory based on title.
 
---async,   Enable async mode - stream rips are executed in parallel as background jobs.
--a
+--async, -a
+  Enable async mode - stream rips are executed in parallel as background jobs.
 
---wait,    When using async mode, wait for all background jobs before exiting,
--w         and report their status as they finish.
+--wait, -w
+  When using async mode, wait for all background jobs before exiting,
+  and report their status as they finish.
 
---meta,    Only show extracted metadata from URL, do not actually rip video
--m         stream or write any files.
+--meta, -m
+  Only show extracted metadata from URL, do not actually rip video
+  stream or write any files.
 
---out,     Optionally set output file. (Normally, a suitable file name is generated.)
--o         This option is not compatible with multiple URLs.
+--out FILE, -o FILE
+  Optionally set output FILE. (Normally, a suitable file name is generated.)
+  This option is not compatible with multiple URLs.
 
---jobs,    Max number of simultaneous background jobs (integer >= 1). Default is unlimited.
--j         Only applicable when using '--wait'.
+--jobs, -j
+  Max number of simultaneous background jobs (integer >= 1).
+  Default is unlimited. Only applicable when using '--wait'.
 
---dir,     Always use a title-based directory as parent of output files, even
--d         though it does not already exist (will be created on demand).
+--dir, -d
+  Always use a title-based directory as parent of output files, even
+  though it does not already exist (will be created on demand).
 
---subs,    Experimental: try to fetch and convert subtitles. If successful, the subtitles will
--s         be saved in ".srt" format using the same basename as the output file.
+--subs, -s
+  Experimental: try to fetch and convert subtitles. If successful, the subtitles
+  will be saved in ".srt" format using the same basename as the output file.
 
--y         Always overwrite output files. Useful especially when running in async mode.
+--yes, -y
+  Always overwrite output files. Useful especially when running in async mode.
 
---version, Show versions of script, Perl and ffmpeg.
--v
+--progress LOGFILE|-, -p LOGFILE|-
+  Analyze ffmpeg progress based on contents of LOGFILE and print a numeric
+  percentage between 0.0 and 100.0, then exit. This can be used to periodically
+  check progress of ffmpeg jobs. If LOGFILE is "-", then input is continually
+  read from STDIN and progress continually printed to STDOUT.
+
+--version, -v
+  Show versions of script, Perl and ffmpeg.
 EOF
     exit 0;
 }
 
 # Main program flow begin
-my ($opt_async,$opt_meta,$opt_dir,$opt_wait,$opt_jobs,$opt_subs,$opt_owr,$opt_outfile) = (0,0,0,0,0,0,undef);
+my $opt_async = 0;
+my $opt_meta = 0;
+my $opt_dir = 0;
+my $opt_wait = 0;
+my $opt_jobs = 0;
+my $opt_subs = 0;
+my $opt_owr = 0;
+my $opt_prog = 0;
+my $opt_outfile;
 GetOptions('h|help' => \&print_usage_exit,
            'a|async' => \$opt_async,
            'm|meta' => \$opt_meta,
@@ -415,8 +490,13 @@ GetOptions('h|help' => \&print_usage_exit,
            'v|version' => \&print_version_exit,
            'j|jobs=i' => \$opt_jobs,
            's|subs' => \$opt_subs,
-           'y' => \$opt_owr
+           'y|yes' => \$opt_owr,
+           'p|progress=s' => \$opt_prog
     );
+
+if ($opt_prog) {
+    &print_progress($opt_prog);
+}
 
 die('Error: missing URL(s)') if (! exists $ARGV[0]);
 if ($opt_outfile and scalar @ARGV > 1) {

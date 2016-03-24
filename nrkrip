@@ -26,7 +26,7 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.5';
+use constant VERSION => '0.5.1';
 
 # Fetch content at URL
 # Takes URL as first argument, and a ref as second arg
@@ -306,8 +306,8 @@ sub rip_stream {
             $cc_url =~ s/%([A-Fa-f\d]{2})/chr hex $1/ge;
             if (my $subtitles = &get_subtitles($cc_url)) {
                 (my $srtfile = $outfile) =~ s/\.[^\.]+$/.srt/;
-                if ($opt_owr or not -e $srtfile) {
-                    open SRTFILE, ">$srtfile" or die("Failed to open file for writing: $srtfile");
+                if ($opt_owr or not -e encode('UTF-8',$srtfile)) {
+                    open SRTFILE, ">", encode('UTF-8',$srtfile) or die("Failed to open file for writing: $srtfile");
                     binmode SRTFILE, ':utf8:crlf';
                     print SRTFILE $subtitles;
                     print "Wrote subtitles to: $srtfile\n\n";

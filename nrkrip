@@ -231,8 +231,8 @@ sub prepare_outfile {
         }
 
         # Replace some "unsafe" chars in file names:
-        $outfile =~ s/[:&?*\/]/_/g;
-        $outdir =~ s/[:&?*\/]/_/g;
+        $outfile =~ s/[:?*\/]/_/g;
+        $outdir =~ s/[:?*\/]/_/g;
 
         if (-d encode('UTF-8',$outdir) or $opt_dir) {
             $outfile = "$outdir/$outfile";

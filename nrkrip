@@ -229,6 +229,11 @@ sub prepare_outfile {
             $outdir =~ s/([0-9]{2,4}\.){2}[0-9]{2,4}//;
             $outdir =~ s/^(\s|-)+|(\s|-)+$//g;
         }
+
+        # Replace some "unsafe" chars in file names:
+        $outfile =~ s/[:&?*/]/_/g;
+        $outdir =~ s/[:&?*/]/_/g;
+
         if (-d encode('UTF-8',$outdir) or $opt_dir) {
             $outfile = "$outdir/$outfile";
         }

@@ -26,7 +26,10 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.5.1';
+use constant VERSION => '0.6';
+
+# User agent to fake for http calls
+use constant HTTP_USER_AGENT => 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:46.0) Gecko/20100101 Firefox/46.0';
 
 # Fetch content at URL
 # Takes URL as first argument, and a ref as second arg
@@ -40,6 +43,8 @@ sub http_fetch_body {
     my $curl = WWW::Curl::Easy->new;
     $curl->setopt(CURLOPT_URL, $url);
     $curl->setopt(CURLOPT_FOLLOWLOCATION, 1);
+    $curl->setopt(CURLOPT_USERAGENT, HTTP_USER_AGENT);
+    $curl->setopt(CURLOPT_COOKIE, 'NRK_PLAYER_SETTINGS_TV=devicetype=desktop&preferred-player-odm=hlslink&preferred-player-live=hlslink');
     $$content = undef;
     $curl->setopt(CURLOPT_WRITEDATA, $content);
     my $retcode = $curl->perform();
@@ -49,6 +54,36 @@ sub http_fetch_body {
     } else {
         return -$retcode;
     }
+}
+
+# Expects original input URL as first argument
+# Expects program id as second argument
+# Returns a list with video stream URL as first element and subtitles stream as second URL if available
+sub psapi_get_stream_urls {
+    my ($url, $programid) = @_;
+
+    # NRK web pages do JSONP calls to psapi
+    my $nrk_psapi_url = "https://psapi.nrk.no/mediaelement/${programid}";
+    if (! $url =~ /tv\.nrksuper\.no/) {
+        $nrk_psapi_url .= '?inSuperUniverse=False&callback=';
+    } else {
+        $nrk_psapi_url .= '?callback=';
+    }
+
+    my $json_content;
+    return undef unless &http_fetch_body($nrk_psapi_url, \$json_content) == 200;
+
+    my @retval = (undef,undef);
+    if ($json_content =~ /"mediaUrl"\s*:\s*"([^"]+)"/) {
+        $retval[0] = $1;
+    }
+    if ($json_content =~ /"webVttSubtitlesUrl"\s*:\s*"([^"]+)"/) {
+        my $webvtt_url = $1;
+        $webvtt_url =~ s/\+/ /g;
+        $webvtt_url =~ s/%([A-Fa-f\d]{2})/chr hex $1/ge;
+        $retval[1] = $webvtt_url;
+    }
+    return @retval;
 }
 
 # Takes URL as first argument.
@@ -79,13 +114,15 @@ sub get_metadata {
 
         if ('meta' eq $tagname) {
             if (exists $attr->{'name'} && exists $attr->{'content'}) {
-                my ($metaname, $content) = ($attr->{'name'}, $attr->{'content'});
-                if ('episodenumber' eq $metaname) {
+                my ($name, $content) = ($attr->{'name'}, $attr->{'content'});
+                if ('episodenumber' eq $name) {
                     $meta{'episode'} = $content;
-                } elsif ('seriestitle' eq $metaname) {
+                } elsif ('seriestitle' eq $name) {
                     $meta{'seriestitle'} = $content;
-                } elsif ('kategori_id' eq $metaname) {
+                } elsif ('kategori_id' eq $name) {
                     $meta{'category'} = $content;
+                } elsif ('programid' eq $name) {
+                    $meta{'programid'} = $content;
                 }
             }
         } elsif ('div' eq $tagname) {
@@ -135,6 +172,28 @@ sub get_metadata {
     $p->parse($html_content);
 
     # Some cleanups, formatting of values and addition of derived values
+    # New in v0.6, this is an alternative way to get the stream URLs:
+    if (not exists $meta{'streamUrl'}) {
+        if (exists $meta{'programid'}) {
+            my @stream_urls = &psapi_get_stream_urls($url, $meta{'programid'});
+            if (@stream_urls and $stream_urls[0]) {
+                $meta{'streamUrl'} = $stream_urls[0];
+            }
+            if (@stream_urls and $stream_urls[1]) {
+                $meta{'subtitlesUrl'} = $stream_urls[1];
+            }
+        }
+    } elsif ($meta{'streamUrl'} =~ /(.*)\?cc1=(uri[^&]+)/) {
+        # Extract subtitle URL from video stream URL
+        $meta{'streamUrl'} = $1;
+        my $subtitles_url = $2;
+        $subtitles_url =~ s/^uri%3[dD]//;
+        $subtitles_url =~ s/\+/ /g;
+        $subtitles_url =~ s/%([A-Fa-f\d]{2})/chr hex $1/ge;
+        $subtitles_url =~ s/^(.*\.m3u8)~.*/$1/;
+        $meta{'subtitlesUrl'} = $subtitles_url;
+    }
+    
     $meta{'title'} =~ s/^(NRK (Super )?TV)?[\s-]*|[\s-]*([0-9]+:[0-9]+)?$//g if exists $meta{'title'};
     if (exists $meta{'title'} and exists $meta{'seriestitle'}
         and $meta{'title'} eq $meta{'seriestitle'} and !exists $meta{'season'}
@@ -149,6 +208,7 @@ sub get_metadata {
 }
 
 # Try to fetch subtitle stream
+# Expects URL for WebVTT subtitle playlist as first argument
 # Returns subtitle stream as a string in ".srt" format if successful
 sub get_subtitles {
     my ($cc_url) = @_;
@@ -280,7 +340,7 @@ sub generate_logfile_name {
 # If async mode, returns PID and associated log file as list, otherwise returns
 # ffmpeg exit code.
 sub rip_stream {
-    my ($streamUrl, $outfile, $opt_async, $opt_owr, $opt_subs) = @_;
+    my ($meta, $outfile, $opt_async, $opt_owr, $opt_subs) = @_;
     if (my $pid = fork) {
         if ($opt_async) {
             my $logfile = &generate_logfile_name($outfile, $pid);
@@ -304,12 +364,8 @@ sub rip_stream {
             open STDIN, "</dev/null";
         }
         # Subtitles
-        if ($opt_subs and $streamUrl =~ /\?cc1=(uri[^&]+)/) {
-            my $cc_url = $1;
-            $cc_url =~ s/^uri%3[dD]//;
-            $cc_url =~ s/\+/ /g;
-            $cc_url =~ s/%([A-Fa-f\d]{2})/chr hex $1/ge;
-            if (my $subtitles = &get_subtitles($cc_url)) {
+        if ($opt_subs and exists $meta->{'subtitlesUrl'}) {
+            if (my $subtitles = &get_subtitles($meta->{'subtitlesUrl'})) {
                 (my $srtfile = $outfile) =~ s/\.[^\.]+$/.srt/;
                 if ($opt_owr or not -e encode('UTF-8',$srtfile)) {
                     open SRTFILE, ">", encode('UTF-8',$srtfile) or die("Failed to open file for writing: $srtfile");
@@ -325,7 +381,7 @@ sub rip_stream {
         }
         
         # FFmpeg
-        system(FFMPEG,'-i',$streamUrl,@ffmpeg_opts,encode('UTF-8',$outfile));
+        system(FFMPEG,'-i',$meta->{'streamUrl'},@ffmpeg_opts,encode('UTF-8',$outfile));
         my $exitcode = $? >> 8;
         if ($? == -1) {
             print LOGFH "Failed to execute ffmpeg:\t$!\n";
@@ -540,10 +596,10 @@ while (my $url = shift) {
 
     print "--- Stream rip ---\n";
     if ($opt_async) {
-        my ($pid, $logfile) = &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async, $opt_owr, $opt_subs);
+        my ($pid, $logfile) = &rip_stream($meta, $outfile, $opt_async, $opt_owr, $opt_subs);
         $jobs{$pid} = [$logfile,$url];
     } else {
-        &rip_stream($meta->{'streamUrl'}, $outfile, $opt_async, $opt_owr, $opt_subs);
+        &rip_stream($meta, $outfile, $opt_async, $opt_owr, $opt_subs);
     }
     print "--- End stream rip ---\n\n";
     

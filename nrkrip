@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 # Rip video streams from tv.nrk.no/tv.nrksuper.no
-# Requires ffmpeg on PATH and Perl modules 'WWW::Curl', 'HTML::Parser'
+# Requires ffmpeg on PATH and Perl modules 'WWW::Curl', 'HTML::Parser'.
+# Use a recent ffmpeg version for best results.
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
 #
@@ -15,6 +16,7 @@ use WWW::Curl::Easy;
 use HTML::Parser;
 use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
+use File::Temp qw(tempfile);
 use Getopt::Long qw(:config bundling);
 use Encode qw(encode decode);
 
@@ -26,7 +28,7 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.6';
+use constant VERSION => '0.7';
 
 # User agent to fake for http calls
 use constant HTTP_USER_AGENT => 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:46.0) Gecko/20100101 Firefox/46.0';
@@ -335,6 +337,49 @@ sub generate_logfile_name {
     return "ffmpeg-nrkrip-${name}-${pid}.log";
 }
 
+# Check HLS stream and maybe apply workarounds for ffmpeg compatibility.
+# (ffmpeg does not handle upper case "HTTP:" protocol spec properly)
+# Expects HLS stream URL as first and only parameter.
+# Returns HLS stream URL or possibly an alternate URL to temporary local stream playlists.
+sub process_stream_quirks {
+    my ($streamUrl, $input_opts_ref, $output_opts_ref) = @_;
+    return unless $streamUrl;
+    my $playlist;
+    return $streamUrl unless &http_fetch_body($streamUrl, \$playlist) == 200;
+    return $streamUrl unless (grep /^HTTPS?:/, split(/^/,$playlist));
+    
+    print "Detected HLS playlist quirk with \"HTTP:\"-scheme entries, employing workarounds ..\n";
+
+    push @$input_opts_ref,('-protocol_whitelist','http,https,tcp,udp,file,crypto');
+
+    my ($fh, $fn) = tempfile('master.XXXXXX', SUFFIX => '.m3u8', UNLINK => 1);
+    binmode $fh, ':utf8';
+
+    foreach (split(/^/,$playlist)) {
+        if (/^(HTTPS?)(:.*)/i) {
+            my $indexurl = lc($1) . $2;
+            my $indexlist;
+            &http_fetch_body($indexurl, \$indexlist);
+            my ($index_fh, $index_fn) = tempfile('index.XXXXXX', SUFFIX => '.m3u8', UNLINK => 1);
+            binmode $index_fh, ':utf8';
+            foreach my $index_line (split(/^/,$indexlist)) {
+                if ($index_line =~ /^(HTTPS?)(:.*)/i) {
+                    print $index_fh lc($1) . $2 . "\n";
+                } else {
+                    print $index_fh $index_line;
+                }
+            }
+            close $index_fh;
+            print $fh $index_fn . "\n";
+        } else {
+            print $fh $_;
+        }
+    }
+    close $fh;
+
+    return 'file:' . $fn;
+}
+
 # Invoke ffmpeg to save stream URL to file with necessary compatiblity
 # conversions.
 # If async mode, returns PID and associated log file as list, otherwise returns
@@ -353,8 +398,9 @@ sub rip_stream {
         }
     } else {
         # Sentinel process
-        my @ffmpeg_opts = ('-c','copy','-bsf:a','aac_adtstoasc');
-        push @ffmpeg_opts, '-y' if ($opt_owr);
+        my @ffmpeg_input_opts = ();
+        my @ffmpeg_output_opts = ('-c','copy','-bsf:a','aac_adtstoasc');
+        push @ffmpeg_output_opts, '-y' if ($opt_owr);
         open LOGFH, ">&STDERR";
         if ($opt_async) {
             my $logfile = encode('UTF-8', &generate_logfile_name($outfile, $$));
@@ -363,6 +409,7 @@ sub rip_stream {
             open STDERR, ">&LOGFH";
             open STDIN, "</dev/null";
         }
+
         # Subtitles
         if ($opt_subs and exists $meta->{'subtitlesUrl'}) {
             if (my $subtitles = &get_subtitles($meta->{'subtitlesUrl'})) {
@@ -379,9 +426,11 @@ sub rip_stream {
                 }
             }
         }
-        
+
         # FFmpeg
-        system(FFMPEG,'-i',$meta->{'streamUrl'},@ffmpeg_opts,encode('UTF-8',$outfile));
+        my $streamUrl = &process_stream_quirks($meta->{'streamUrl'}, \@ffmpeg_input_opts, \@ffmpeg_output_opts);
+
+        system(FFMPEG,@ffmpeg_input_opts,'-i',$streamUrl,@ffmpeg_output_opts,encode('UTF-8',$outfile));
         my $exitcode = $? >> 8;
         if ($? == -1) {
             print LOGFH "Failed to execute ffmpeg:\t$!\n";

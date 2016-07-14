@@ -292,9 +292,9 @@ sub prepare_outfile {
             $outdir =~ s/^(\s|-)+|(\s|-)+$//g;
         }
 
-        # Replace some "unsafe" chars in file names:
-        $outfile =~ s/[:?*\/]/_/g;
-        $outdir =~ s/[:?*\/]/_/g;
+        # Replace some "unsafe" chars in file names (compat with storage to Samba share)
+        $outfile =~ s/[\\\/:*?"<>|]/_/g;
+        $outdir =~ s/[\\\/:*?"<>|]/_/g;
 
         if (-d encode('UTF-8',$outdir) or $opt_dir) {
             $outfile = "$outdir/$outfile";

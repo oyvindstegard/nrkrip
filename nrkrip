@@ -1,11 +1,12 @@
 #!/usr/bin/env perl
+# Command line utility to rip video streams from Norwegian national broadcasting service NRK.
 # Rip video streams from tv.nrk.no/tv.nrksuper.no
 # Requires ffmpeg on PATH and Perl modules 'WWW::Curl', 'HTML::Parser'.
 # Use a recent ffmpeg version for best results.
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
 #
-# Author: oyvind.stegard@ifi.uio.no, http://stegard.net/
+# Author: oyvind@stegard.net, https://stegard.net/
 
 package nrkrip;
 

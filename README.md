@@ -11,7 +11,7 @@ Requirements
 ------------
 
 *   Recent-ish version of ffmpeg binary for best results, available in PATH
-*   Perl with modules 'WWW::Curl' and 'HTML::Parser' installed.
+*   Perl with modules `WWW::Curl` and `HTML::Parser` installed.
 
 It has only been tested on UNIX-like operating systems (Linux, OSX). I have no
 idea how it works on the Windows platform.

@@ -1,12 +1,27 @@
 #!/usr/bin/env perl
-# Command line utility to rip video streams from Norwegian national broadcasting service NRK.
-# Rip video streams from tv.nrk.no/tv.nrksuper.no
-# Requires ffmpeg on PATH and Perl modules 'WWW::Curl', 'HTML::Parser'.
+# Command line utility to rip video streams from Norwegian national broadcasting
+# service NRK, http://nrk.no/, http://tv.nrk.no/, http://tv.nrksuper.no/
+#
+# Requires ffmpeg binary in PATH and Perl modules 'WWW::Curl', 'HTML::Parser'.
 # Use a recent ffmpeg version for best results.
 # This script will only output UTF-8 encoded data, both for output and
 # generated file names.
 #
-# Author: oyvind@stegard.net, https://stegard.net/
+# Copyright 2016 Øyvind Stegard <oyvind@stegard.net>
+# https://stegard.net/
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package nrkrip;
 
@@ -29,19 +44,21 @@ binmode STDERR, ':utf8';
 use constant FFMPEG => 'ffmpeg';
 
 # Version
-use constant VERSION => '0.7';
+use constant VERSION => '1.0';
 
 # User agent to fake for http calls
 use constant HTTP_USER_AGENT => 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:46.0) Gecko/20100101 Firefox/46.0';
 
-# Fetch content at URL
-# Takes URL as first argument, and a ref as second arg
+# Fetch content at URL.
+# Takes URL as first argument, and variable references as second and third args.
 # Returns http status code if request went through, otherwise a negative
 # value is returned (which is the curl error code)
-# Content will be stored in variable referred to by second argument
+# Content will be stored in variable referred to by second argument.
+# Content type will be stored in variable referred to by third argument, if that
+# argument is provided (optional)
 sub http_fetch_body {
-    die("http_fetch_body: wrong number of arguments") if @_ != 2;
-    my ($url, $content) = @_;
+    die("http_fetch_body: wrong number of arguments") if @_ < 2 || @_ > 3;
+    my ($url, $content, $content_type) = @_;
     if (!$url) { return undef };
     my $curl = WWW::Curl::Easy->new;
     $curl->setopt(CURLOPT_URL, $url);
@@ -51,7 +68,10 @@ sub http_fetch_body {
     $$content = undef;
     $curl->setopt(CURLOPT_WRITEDATA, $content);
     my $retcode = $curl->perform();
-
+    if ($content_type) {
+        $$content_type = $curl->getinfo(CURLINFO_CONTENT_TYPE);
+    }
+    
     if ($retcode == 0) {
         return $curl->getinfo(CURLINFO_HTTP_CODE);
     } else {
@@ -98,7 +118,11 @@ sub get_metadata {
     }
 
     my $html_content;
-    &http_fetch_body($url, \$html_content) == 200 or die("Failed to fetch: $url");
+    my $html_content_type;
+    &http_fetch_body($url, \$html_content, \$html_content_type) == 200 or die("Failed to fetch: $url");
+    if ($html_content_type && $html_content_type =~ /charset=([^; ]+)/i) {
+        $html_content = decode($1, $html_content);
+    }
 
     my %meta = ('url' => $url);
     my @context = ();
@@ -169,7 +193,7 @@ sub get_metadata {
                               start_h => [$start_handler, "tagname, attr"],
                               text_h => [$text_handler, "dtext"],
                               end_h => [$end_handler, "tagname"],
-                              utf8_mode => 1,
+                              utf8_mode => 0, # Content should be decoded before parsing
                               unbroken_text => 1,
                               empty_element_tags => 1);
     $p->parse($html_content);
@@ -230,7 +254,7 @@ sub get_subtitles {
         $webvtt_url = $webvtt_url . "/" . $webvtt_ref;
         my $webvtt_content;
         return undef unless &http_fetch_body($webvtt_url, \$webvtt_content) == 200;
-
+        
         $webvtt_content =~ s/\r//sg;
         return undef unless $webvtt_content =~ s/^.*?\n([0-9]+\n)/$1/s; # strip webvtt header
         my $first_number = $1;
@@ -251,7 +275,6 @@ sub get_subtitles {
 
         $content .= $webvtt_content;
     }
-
 
     # Convert WEBVTT content to SRT
     $content = decode('UTF-8', $content);
@@ -349,7 +372,7 @@ sub process_stream_quirks {
     return $streamUrl unless &http_fetch_body($streamUrl, \$playlist) == 200;
     return $streamUrl unless (grep /^HTTPS?:/, split(/^/,$playlist));
     
-    print "Detected HLS playlist quirk with \"HTTP:\"-scheme entries, employing workarounds ..\n";
+    print "Detected HLS playlist quirk with \"HTTP:\"-scheme entries, employing workarounds.\n";
 
     push @$input_opts_ref,('-protocol_whitelist','http,https,tcp,udp,file,crypto');
 
@@ -534,11 +557,18 @@ Use: ${name} [opts] SOURCE [SOURCE ..]
 SOURCE is typically a playback URL for an episode or program on
 tv.nrk.no/tv.nrksuper.no. It can also be a file with list of such URLs.
 
+Example:
+\$ nrkrip https://tv.nrk.no/serie/lille-loerdag/FKUN19001096/27-11-1996
+
 You may alternativly provide direct HLS stream URLs, which will be ripped. This
 may be used to rip from sources other than NRK.
 
 By default, output files are saved to current directory, possibly with a
 generated parent directory based on title.
+
+--meta, -m
+  Only show extracted metadata from URL, do not actually rip video
+  stream or write any files. Can be used to test metadata extraction.
 
 --async, -a
   Enable async mode - stream rips are executed in parallel as background jobs.
@@ -546,10 +576,6 @@ generated parent directory based on title.
 --wait, -w
   When using async mode, wait for all background jobs before exiting,
   and report their status as they finish.
-
---meta, -m
-  Only show extracted metadata from URL, do not actually rip video
-  stream or write any files.
 
 --out FILE, -o FILE
   Optionally set output FILE. (Normally, a suitable file name is generated.)
@@ -573,7 +599,7 @@ generated parent directory based on title.
 --progress LOGFILE|-, -p LOGFILE|-
   Analyze ffmpeg progress based on contents of LOGFILE and print a numeric
   percentage between 0.0 and 100.0, then exit. This can be used to periodically
-  check progress of ffmpeg jobs. If LOGFILE is "-", then input is continually
+  check progress of async jobs. If LOGFILE is "-", then input is continually
   read from STDIN and progress continually printed to STDOUT.
 
 --version, -v

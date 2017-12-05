@@ -1,6 +1,8 @@
 nrkrip - Rip video streams from nrk.no
 ======================================
 
+*Note: this utility no longer works properly, as NRK changed their streaming methods a while back. I have no incentives to fix it yet, but leave it here for inspiration*
+
 Command line utility to rip video streams from the Norwegian national
 broadcasting service NRK.no.
 

@@ -3,7 +3,7 @@ nrkrip - Rip video streams from nrk.no
 
 **Note: this utility no longer works properly, as NRK changed their streaming methods a while back. I have no incentives to fix it yet, but leave it here for inspiration, along with some thoughts on how to get it working again.**
 
-*Since the video source URLs are no longer directly present in the statically served HTML page for a video, one would need to apply a different strategy to extract them. For instance by parsing/executing the page using a headless browser engine and extracting the PSAPI metadata URL (psapi-we.nrk.no) from the live DOM after "playback" has started. From the PSAPI metadata URL content (JSON), you can find the CDN M3U8 video stream URLs which ffmpeg is able to save.*
+*Since the video source URLs are no longer directly present in the statically served HTML page for a video, one would need to apply a different strategy to extract them. For instance by parsing/executing the page using a headless browser engine and extracting the PSAPI metadata URL (psapi-*.nrk.no) from the live DOM after "playback" has started. From the PSAPI metadata URL content (JSON), you can find the CDN M3U8 video stream URLs which ffmpeg is able to save.*
 
 Command line utility to rip video streams from the Norwegian national
 broadcasting service NRK.no.
